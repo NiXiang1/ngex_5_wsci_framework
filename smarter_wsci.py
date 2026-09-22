@@ -1,33 +1,30 @@
-"""A small WSCI (Write, Select, Compress, Isolate) demonstration.
+"""A complete Write, Select, Compress, Isolate (WSCI) demonstration."""
 
-The program keeps reusable structured state, selects only relevant knowledge,
-compresses it with Qwen, isolates the current task's state, and asks Qwen for a
-structured support answer.
-"""
+from __future__ import annotations
 
-import os
-from pathlib import Path
-from ollama import chat
+import argparse
 import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+from ollama import chat
 
 
-MODEL = os.getenv("OLLAMA_MODEL", "qwen3:0.6b")
-BASE_DIR = Path(__file__).parent
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
-STATE_PATH = BASE_DIR / "state.json"
-
-question = """
-I changed my university password this morning.
+DEFAULT_STATE_PATH = BASE_DIR / "state.json"
+DEFAULT_QUESTION = """I changed my university password this morning.
 Now my Windows laptop won't connect to campus Wi-Fi,
-but my phone still works.
-""".strip()
+but my phone still works."""
 
-
-# Keywords are intentionally simple for this classroom exercise. A production
-# version would replace this table with embeddings and semantic search.
+# This transparent keyword selector is intentional for the classroom exercise.
+# A production system could replace it with embeddings and semantic search.
 FILE_KEYWORDS = {
     "wifi_setup.txt": ("wi-fi", "wifi", "wireless", "eduroam", "windows", "laptop"),
-    "password_changes.txt": ("password", "credential", "login", "sign in"),
+    "password_changes.txt": ("password", "credential", "credentials", "login"),
     "service_status.txt": ("status", "outage", "down", "works", "operational"),
     "email_setup.txt": ("email", "mail", "outlook", "webmail"),
     "printing.txt": ("print", "printer", "printing"),
@@ -38,48 +35,82 @@ FILE_KEYWORDS = {
 COMPRESSION_SCHEMA = {
     "type": "object",
     "properties": {
-        "relevant_facts": {"type": "array", "items": {"type": "string"}},
-        "recommended_actions": {"type": "array", "items": {"type": "string"}},
-        "warnings": {"type": "array", "items": {"type": "string"}},
+        "relevant_facts": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 180},
+            "minItems": 1,
+            "maxItems": 4,
+        },
+        "recommended_actions": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 180},
+            "minItems": 1,
+            "maxItems": 3,
+        },
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 180},
+            "maxItems": 2,
+        },
     },
     "required": ["relevant_facts", "recommended_actions", "warnings"],
+    "additionalProperties": False,
 }
-
 ANSWER_SCHEMA = {
     "type": "object",
     "properties": {
-        "diagnosis": {"type": "string"},
-        "steps": {"type": "array", "items": {"type": "string"}},
-        "escalate_if": {"type": "array", "items": {"type": "string"}},
+        "diagnosis": {"type": "string", "maxLength": 250},
+        "steps": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 180},
+            "minItems": 1,
+            "maxItems": 4,
+        },
+        "escalate_if": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 180},
+            "maxItems": 3,
+        },
     },
     "required": ["diagnosis", "steps", "escalate_if"],
+    "additionalProperties": False,
 }
 
 
-def select_context(user_question: str) -> list[Path]:
-    """SELECT knowledge files whose keyword score is non-zero."""
+def _keyword_present(keyword: str, query: str) -> bool:
+    """Match complete keywords so, for example, 'mail' does not match 'email'."""
+    return re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", query) is not None
+
+
+def select_context(user_question: str, limit: int = 3) -> list[Path]:
+    """SELECT the highest-scoring knowledge documents for a question."""
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
     query = user_question.casefold()
-    scored_files = []
-
+    scored_files: list[tuple[int, Path]] = []
     for filename, keywords in FILE_KEYWORDS.items():
-        score = sum(keyword in query for keyword in keywords)
-        if score:
-            scored_files.append((score, KNOWLEDGE_DIR / filename))
-
+        score = sum(_keyword_present(keyword, query) for keyword in keywords)
+        path = KNOWLEDGE_DIR / filename
+        if score and path.is_file():
+            scored_files.append((score, path))
     scored_files.sort(key=lambda item: (-item[0], item[1].name))
-    return [path for _, path in scored_files]
+    return [path for _, path in scored_files[:limit]]
 
 
 def read_context(selected_files: list[Path]) -> str:
+    """Read selected files and keep source names visible to the model."""
+    if not selected_files:
+        raise ValueError("At least one context file must be selected")
     sections = []
     for file in selected_files:
-        text = file.read_text(encoding="utf-8").strip()
-        sections.append(f"--- {file.name} ---\n{text}")
+        if not file.is_file():
+            raise FileNotFoundError(f"Knowledge file not found: {file}")
+        sections.append(f"--- {file.name} ---\n{file.read_text(encoding='utf-8').strip()}")
     return "\n\n".join(sections)
 
 
-def parse_json_object(raw_text: str, label: str) -> dict:
-    """Validate that a model response is a JSON object."""
+def parse_json_object(raw_text: str, label: str) -> dict[str, Any]:
+    """Parse a model response and require a JSON object."""
     try:
         value = json.loads(raw_text)
     except json.JSONDecodeError as exc:
@@ -89,16 +120,37 @@ def parse_json_object(raw_text: str, label: str) -> dict:
     return value
 
 
-def compress_context(context: str, user_question: str) -> dict:
-    """COMPRESS the selected documents down to facts relevant to the question."""
+def validate_string_list_object(
+    value: dict[str, Any], required_keys: tuple[str, ...], label: str
+) -> dict[str, Any]:
+    """Validate structured output even if a model ignores the JSON schema."""
+    if set(value) != set(required_keys):
+        raise ValueError(f"{label} must contain exactly: {', '.join(required_keys)}")
+    for key in required_keys:
+        item = value[key]
+        if key == "diagnosis":
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"{label}.{key} must be a non-empty string")
+        elif not isinstance(item, list) or not all(
+            isinstance(entry, str) and entry.strip() for entry in item
+        ):
+            raise ValueError(f"{label}.{key} must be a list of non-empty strings")
+    return value
+
+
+def compress_context(context: str, user_question: str, model: str) -> dict[str, Any]:
+    """COMPRESS selected documents to facts that address this question."""
     response = chat(
-        model=MODEL,
+        model=model,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Extract only facts that help answer the student's problem. "
-                    "Do not invent facts. Return JSON matching the supplied schema."
+                    "Compress the documents into short support facts for this exact "
+                    "problem. Include only facts and actions that directly help solve "
+                    "it. A document may mention other services; omit them unless the "
+                    "question asks about them. Do not invent menu paths or details. "
+                    "Return concise JSON matching the supplied schema."
                 ),
             },
             {
@@ -109,46 +161,75 @@ def compress_context(context: str, user_question: str) -> dict:
         format=COMPRESSION_SCHEMA,
         options={"temperature": 0},
     )
-    return parse_json_object(response.message.content, "compressed context")
+    result = parse_json_object(response.message.content, "compressed context")
+    return validate_string_list_object(
+        result,
+        ("relevant_facts", "recommended_actions", "warnings"),
+        "compressed context",
+    )
 
 
-def classify_problem(user_question: str) -> str:
-    """Return the state partition needed for this question (ISOLATE)."""
-    selected = select_context(user_question)
-    if not selected:
-        return "general"
-    return selected[0].stem
+def classify_problem(selected_files: list[Path]) -> str:
+    """Use the best SELECT result as the state partition for ISOLATE."""
+    return selected_files[0].stem if selected_files else "general"
 
 
-def load_state() -> dict:
-    if not STATE_PATH.exists():
-        return {"diagnostic_contexts": {}, "report_context": {}}
-    with STATE_PATH.open(encoding="utf-8") as file:
-        value = json.load(file)
+def empty_state() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "diagnostic_contexts": {},
+        "report_context": {"total_cases": 0, "cases_by_category": {}},
+    }
+
+
+def load_state(state_path: Path) -> dict[str, Any]:
+    """Load and minimally validate the state artifact."""
+    if not state_path.exists():
+        return empty_state()
+    try:
+        value = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{state_path} is not valid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("state.json must contain a JSON object")
+    value.setdefault("schema_version", 1)
     value.setdefault("diagnostic_contexts", {})
     value.setdefault("report_context", {})
+    if not isinstance(value["diagnostic_contexts"], dict):
+        raise ValueError("diagnostic_contexts must be a JSON object")
+    if not isinstance(value["report_context"], dict):
+        raise ValueError("report_context must be a JSON object")
     return value
 
 
-def relevant_state_for(category: str, state: dict) -> dict:
-    """ISOLATE one relevant diagnostic partition instead of exposing all state."""
+def relevant_state_for(category: str, state: dict[str, Any]) -> dict[str, Any]:
+    """ISOLATE only one category; never expose the full state to the model."""
     previous = state.get("diagnostic_contexts", {}).get(category)
-    return {"previous_case": previous} if previous else {}
+    if not isinstance(previous, dict):
+        return {}
+    # Counters, other categories and the previous raw question are deliberately
+    # excluded from the model context.
+    answer = previous.get("answer")
+    return {"previous_answer": answer} if isinstance(answer, dict) else {}
 
 
 def answer_question(
-    user_question: str, compressed_context: dict, isolated_state: dict
-) -> dict:
+    user_question: str,
+    compressed_context: dict[str, Any],
+    isolated_state: dict[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """Answer from compressed evidence plus the isolated prior partition."""
     response = chat(
-        model=MODEL,
+        model=model,
         messages=[
             {
                 "role": "system",
                 "content": (
                     "You are a university IT support assistant. Use only the "
-                    "compressed support facts and relevant prior state. Return JSON "
+                    "compressed support facts and relevant prior state. Every proposed "
+                    "step must be supported by compressed_context.recommended_actions; "
+                    "do not add UI paths or unrelated checks. Return concise JSON "
                     "matching the supplied schema. Never request or repeat passwords."
                 ),
             },
@@ -160,6 +241,7 @@ def answer_question(
                         "compressed_context": compressed_context,
                         "relevant_prior_state": isolated_state,
                     },
+                    ensure_ascii=False,
                     indent=2,
                 ),
             },
@@ -167,18 +249,22 @@ def answer_question(
         format=ANSWER_SCHEMA,
         options={"temperature": 0},
     )
-    return parse_json_object(response.message.content, "support answer")
+    result = parse_json_object(response.message.content, "support answer")
+    return validate_string_list_object(
+        result, ("diagnosis", "steps", "escalate_if"), "support answer"
+    )
 
 
 def write_state(
-    state: dict,
+    state_path: Path,
+    state: dict[str, Any],
     category: str,
     user_question: str,
     selected_files: list[Path],
-    compressed_context: dict,
-    answer: dict,
+    compressed_context: dict[str, Any],
+    answer: dict[str, Any],
 ) -> None:
-    """WRITE structured, reusable information to the state artifact."""
+    """WRITE structured reusable state using an atomic file replacement."""
     state["diagnostic_contexts"][category] = {
         "problem": user_question,
         "selected_files": [file.name for file in selected_files],
@@ -187,42 +273,79 @@ def write_state(
     }
     report = state["report_context"]
     report["total_cases"] = int(report.get("total_cases", 0)) + 1
+    counts = report.setdefault("cases_by_category", {})
+    counts[category] = int(counts.get(category, 0)) + 1
     report["last_category"] = category
 
-    with STATE_PATH.open("w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2, ensure_ascii=False)
-        file.write("\n")
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(state_path)
 
 
-def main() -> None:
-    selected_files = select_context(question)
+def run_pipeline(
+    user_question: str, model: str, state_path: Path = DEFAULT_STATE_PATH
+) -> dict[str, Any]:
+    """Run all four WSCI stages and return metrics useful for comparison."""
+    if not user_question.strip():
+        raise ValueError("question must not be empty")
+    selected_files = select_context(user_question)
     if not selected_files:
         raise RuntimeError("No relevant knowledge files were selected")
 
     context = read_context(selected_files)
-    compressed_context = compress_context(context, question)
-
-    state = load_state()
-    category = classify_problem(question)
+    compressed_context = compress_context(context, user_question, model)
+    state = load_state(state_path)
+    category = classify_problem(selected_files)
     isolated_state = relevant_state_for(category, state)
-    answer = answer_question(question, compressed_context, isolated_state)
+    answer = answer_question(user_question, compressed_context, isolated_state, model)
     write_state(
+        state_path,
         state,
         category,
-        question,
+        user_question,
         selected_files,
         compressed_context,
         answer,
     )
+    return {
+        "model": model,
+        "category": category,
+        "selected_files": [file.name for file in selected_files],
+        "original_context_characters": len(context),
+        "compressed_context_characters": len(
+            json.dumps(compressed_context, ensure_ascii=False)
+        ),
+        "answer": answer,
+        "state_path": str(state_path),
+    }
 
-    print("Selected files:", ", ".join(file.name for file in selected_files))
-    print("Original context characters:", len(context))
-    compressed_text = json.dumps(compressed_context, ensure_ascii=False)
-    print("Compressed context characters:", len(compressed_text))
-    print(json.dumps(answer, indent=2, ensure_ascii=False))
-    print(f"State written to: {STATE_PATH}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name")
+    parser.add_argument("--question", default=DEFAULT_QUESTION)
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE_PATH)
+    args = parser.parse_args()
+
+    try:
+        result = run_pipeline(args.question, args.model, args.state.resolve())
+    except Exception as exc:
+        raise SystemExit(
+            f"WSCI pipeline failed: {exc}\n"
+            f"Check that Ollama is running and model '{args.model}' is installed."
+        ) from exc
+
+    print("Model:", result["model"])
+    print("Category:", result["category"])
+    print("Selected files:", ", ".join(result["selected_files"]))
+    print("Original context characters:", result["original_context_characters"])
+    print("Compressed context characters:", result["compressed_context_characters"])
+    print(json.dumps(result["answer"], indent=2, ensure_ascii=False))
+    print("State written to:", result["state_path"])
 
 
 if __name__ == "__main__":
     main()
-
